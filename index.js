@@ -73,6 +73,8 @@ app.post('/login', (req, res) => {
   const client = ldap.createClient({
     url: LDAP_URL,
     tlsOptions: {
+      // TODO: In production, this should be true and a proper CA certificate provided
+      // For development with self-signed certs, this is often necessary.
       rejectUnauthorized: false
     }
   });
@@ -103,7 +105,7 @@ const IOWA_NORTH_NAD83_FTUS = "EPSG:2235";
 proj4.defs(IOWA_NORTH_NAD83_FTUS, '+proj=lcc +lat_0=41.5 +lon_0=-93.5 +lat_1=42.04 +lat_2=43.16 +x_0=1500000 +y_0=1000000 +ellps=GRS80 +datum=NAD83 +units=us-ft +no_defs');
 
 // Use an environment variable for the API base URL, with a default for local development.
-const API_BASE = process.env.P2C_API_BASE || 'http://192.168.0.211:8083/api/Data'
+const API_BASE = process.env.P2C_API_BASE || 'http://localhost:8083/api/Data'
 const cache = new NodeCache({stdTTL: 60*60*24, checkperiod:120}) // 1 day TTL for geocoding
 
 function sanitizeIdentifier(id){
@@ -264,11 +266,16 @@ app.get('/proximity', async (req, res) => {
 // Combined endpoint: fetch both tables, join geocoded coords for DailyBulletinArrests then return combined data
 app.get('/incidents', async (req,res)=>{
   try{
-    // params: limit, distanceKm, centerLat, centerLng, dateFrom, dateTo
-    const {limit=100, distanceKm, centerLat, centerLng, dateFrom, dateTo, filters = ''} = req.query;
+    // params: limit, distanceKm, centerLat, centerLng, dateFrom, dateTo, filters
+    const {limit=100, distanceKm, centerLat, centerLng, dateFrom, dateTo, filters} = req.query;
   // fetch recent cadHandler and DailyBulletinArrests rows (use provided limit)
   const numLimit = Number(limit) || 100;
   const perTypeLimit = Math.ceil(numLimit / 3);
+
+  // CRITICAL: The 'filters' parameter is a SQL injection vector and has been disabled.
+  // Do not re-enable without a safe implementation (e.g., parameterized queries or strict validation).
+  const safeFilters = '';
+  if (filters) console.warn('[incidents] WARNING: The "filters" query parameter is currently disabled for security reasons.');
 
   // Create a separate filter for tables that use 'event_time' instead of 'starttime'
   const dbFilters = (filters || '').replace(/starttime/g, 'event_time');
@@ -286,11 +293,11 @@ app.get('/incidents', async (req,res)=>{
       });
   };
 
-  console.log(`[incidents] INFO: Fetching data with filters: "${filters}" and dbFilters: "${dbFilters}"`);
+  console.log(`[incidents] INFO: Fetching data with filters: "${safeFilters}" and dbFilters: "${dbFilters}"`);
   const results = await Promise.all([
-    buildQuery('cadHandler', filters, 'starttime DESC'),
+    buildQuery('cadHandler', safeFilters, 'starttime DESC'),
     buildQuery('DailyBulletinArrests', dbFilters, 'event_time DESC'),
-    buildQuery('DailyBulletinArrests', `[key] = 'LW'${dbFilters ? ` AND (${dbFilters})` : ''}`, 'event_time DESC')
+    buildQuery('DailyBulletinArrests', `[key] = 'LW'${safeFilters ? ` AND (${safeFilters})` : ''}`, 'event_time DESC')
   ]);
   const [cadRes, arrestRes, crimeRes] = results;
 
