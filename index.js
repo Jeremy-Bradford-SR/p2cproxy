@@ -165,27 +165,35 @@ app.get('/schema', async (req,res)=>{
   }
 })
 
-// Proxy for /query but enforce SELECT only
-app.post('/query', async (req,res)=>{
-  try{
-    // normalize incoming body: accept either a JSON string primitive or an object with { sql: '...' }
-    let sql = null
-    if(typeof req.body === 'string') sql = req.body
-    else if(req.body && typeof req.body.sql === 'string') sql = req.body.sql
-    else return res.status(400).json({error:'SQL must be provided as a JSON string or {sql:"..."}'})
-
-    const s = sql.trim().toUpperCase()
-    if(!s.startsWith('SELECT')){
-      return res.status(400).json({error:'Only SELECT queries allowed'})
-    }
-    // forward the SQL string to upstream as a JSON string
-    console.log('forwarding query to API. SQL:', sql)
-    const r = await axios.post(`${API_BASE}/query`, JSON.stringify(sql), {headers:{'Content-Type':'application/json'}})
-    console.log('upstream query status', r.status)
+// Proxy for the new parameterized /query endpoint
+app.get('/query', async (req, res) => {
+  try {
+    const params = new URLSearchParams(req.query);
+    const url = `${API_BASE}/query?${params.toString()}`;
+    console.log('forwarding parameterized query to API:', url);
+    const r = await axios.get(url);
+    console.log('upstream query status', r.status);
     res.status(r.status).json(r.data)
-  }catch(e){
-    if(e.response) return res.status(e.response.status).json({error:e.response.data || e.response.statusText})
-    res.status(502).json({error: e.message})
+  } catch (e) {
+    if (e.response) return res.status(e.response.status).json({ error: e.response.data || e.response.statusText });
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// Proxy for the rawQuery endpoint (used by legacy functions)
+app.get('/rawQuery', async (req, res) => {
+  try {
+    const sql = req.query.sql;
+    if (!sql || !sql.trim().toUpperCase().startsWith('SELECT')) {
+      return res.status(400).json({ error: 'Only SELECT queries allowed' });
+    }
+    const url = `${API_BASE}/rawQuery?sql=${encodeURIComponent(sql)}`;
+    console.log('forwarding raw query to API. SQL:', sql);
+    const r = await axios.get(url);
+    res.status(r.status).json(r.data);
+  } catch (e) {
+    if (e.response) return res.status(e.response.status).json({ error: e.response.data || e.response.statusText });
+    res.status(502).json({ error: e.message });
   }
 })
 
@@ -241,7 +249,8 @@ app.get('/proximity', async (req, res) => {
     `;
 
     console.log('Executing proximity query:', sql);
-    const r = await axios.post(`${API_BASE}/query`, JSON.stringify(sql), { headers: { 'Content-Type': 'application/json' } });
+    const url = `${API_BASE}/rawQuery?sql=${encodeURIComponent(sql)}`;
+    const r = await axios.get(url);
     
     // Format distance to 2 decimal places and convert geox/geoy back to lat/lon for the map
     const results = (r.data?.data || []).map(row => ({
@@ -266,69 +275,56 @@ app.get('/proximity', async (req, res) => {
 // Combined endpoint: fetch both tables, join geocoded coords for DailyBulletinArrests then return combined data
 app.get('/incidents', async (req,res)=>{
   try{
-    // params: limit, distanceKm, centerLat, centerLng, dateFrom, dateTo, filters
-    const {limit=100, distanceKm, centerLat, centerLng, dateFrom, dateTo, filters} = req.query;
-  // fetch recent cadHandler and DailyBulletinArrests rows (use provided limit)
-  const numLimit = Number(limit) || 100;
-  const perTypeLimit = Math.ceil(numLimit / 3);
+    const { cadLimit = 100, arrestLimit = 100, crimeLimit = 100, dateFrom, dateTo, filters, distanceKm, centerLat, centerLng } = req.query;
 
   // CRITICAL: The 'filters' parameter is a SQL injection vector and has been disabled.
   // Do not re-enable without a safe implementation (e.g., parameterized queries or strict validation).
   const safeFilters = '';
   if (filters) console.warn('[incidents] WARNING: The "filters" query parameter is currently disabled for security reasons.');
 
-  // Create a separate filter for tables that use 'event_time' instead of 'starttime'
-  const dbFilters = (filters || '').replace(/starttime/g, 'event_time');
+  const buildQuery = (table, limit, filters = '', orderBy = 'starttime DESC') => {
+    const params = new URLSearchParams({
+      table,
+      limit: Number(limit) || 100,
+    });
+    if (filters) params.set('filters', filters);
+    if (orderBy) params.set('orderBy', orderBy);
 
-  const buildQuery = (table, where = '', orderBy = 'starttime DESC') => {
-    let sql = `SELECT TOP ${perTypeLimit} * FROM ${table}`;
-    if (where) sql += ` WHERE ${where}`;
-    if (orderBy) sql += ` ORDER BY ${orderBy}`;
-    console.log(`[incidents] EXECUTING SQL for ${table}: ${sql}`);
-    return axios.post(`${API_BASE}/query`, JSON.stringify(sql), { headers: { 'Content-Type': 'application/json' } })
-      .catch(err => {
-        // Log errors from individual queries but don't crash. Return a mock success response.
-        console.error(`[incidents] ERROR: Upstream query failed for table ${table}. Status: ${err.response?.status}. Data:`, err.response?.data);
-        return { data: { data: [] } }; // Return an empty dataset on failure
-      });
+    const url = `${API_BASE}/query?${params.toString()}`;
+    console.log(`[incidents] EXECUTING parameterized query for ${table} via GET: ${url}`);
+    // The backend API now handles constructing the safe SQL
+    return axios.get(url);
   };
 
-  console.log(`[incidents] INFO: Fetching data with filters: "${safeFilters}" and dbFilters: "${dbFilters}"`);
+  console.log(`[incidents] INFO: Fetching data with filters: "${safeFilters}"`);
+  
+  // Build date filters for DailyBulletinArrests table which uses 'event_time'
+  let dbDateFilters = [];
+  if (dateFrom) {
+    dbDateFilters.push(`event_time >= '${dateFrom.replace(/'/g, "''")}'`);
+  }
+  if (dateTo) {
+    dbDateFilters.push(`event_time <= '${dateTo.replace(/'/g, "''")}'`);
+  }
+  const dbFilters = dbDateFilters.join(' AND ');
+
   const results = await Promise.all([
-    buildQuery('cadHandler', safeFilters, 'starttime DESC'),
-    buildQuery('DailyBulletinArrests', dbFilters, 'event_time DESC'),
-    buildQuery('DailyBulletinArrests', `[key] = 'LW'${safeFilters ? ` AND (${safeFilters})` : ''}`, 'event_time DESC')
+    buildQuery('cadHandler', cadLimit, safeFilters, 'starttime DESC'),
+    buildQuery('DailyBulletinArrests', arrestLimit, `[key] <> 'LW'${dbFilters ? ` AND ${dbFilters}` : ''}`, 'event_time DESC'),
+    buildQuery('DailyBulletinArrests', crimeLimit, `[key] = 'LW'${dbFilters ? ` AND ${dbFilters}` : ''}`, 'event_time DESC')
   ]);
   const [cadRes, arrestRes, crimeRes] = results;
 
   console.log(`[incidents] INFO: Received from upstream: ${cadRes.data?.data?.length} CAD, ${arrestRes.data?.data?.length} Arrests, ${crimeRes.data?.data?.length} Crime`);
-
+  
   const cadRows = cadRes.data?.data || [];
   const arrestRows = arrestRes.data?.data || [];
   const crimeRows = crimeRes.data?.data || [];
 
-    // geocode dbRows locations (cached)
-  const geocodeAndTag = async (row, source) => {
-      if(!row.location) return row
-      const g = await geocodeAddress(row.location);
-    return { ...row, lat: g?.lat, lon: g?.lon, _source: source };
-  };
-
-  console.log('[incidents] INFO: Geocoding arrest and crime records...');
-  const geocodedArrests = await Promise.all(arrestRows.map(row => geocodeAndTag(row, 'DailyBulletinArrests')));
-  const geocodedCrime = await Promise.all(crimeRows.map(row => geocodeAndTag(row, 'Crime')));
-
-    // Process cadRows: convert UTM or geocode address
-    console.log('[incidents] INFO: Geocoding CAD records...');
-    const processedCadRows = await Promise.all(cadRows.map(async r => {
-      // If no UTM, try geocoding the address/location
-      const address = r.location || r.address;
-      if (address) {
-        const g = await geocodeAddress(address);
-        return { ...r, lat: g?.lat, lon: g?.lon, _source: 'cadHandler' };
-      }
-      return { ...r, _source: 'cadHandler' };
-    }));
+  // Tag rows with their source and combine them. Geocoding will now happen on the client.
+  const processedCadRows = cadRows.map(r => ({ ...r, _source: 'cadHandler' }));
+  const geocodedArrests = arrestRows.map(r => ({ ...r, _source: 'DailyBulletinArrests' }));
+  const geocodedCrime = crimeRows.map(r => ({ ...r, _source: 'Crime' }));
 
     console.log('[incidents] INFO: Combining and filtering results...');
     let combined = []
