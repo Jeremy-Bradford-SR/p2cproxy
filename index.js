@@ -23,7 +23,7 @@ app.use(cors())
 app.use(bodyParser.json({ strict: false }))
 
 // simple request logger
-app.use((req,res,next)=>{
+app.use((req, res, next) => {
   console.log(new Date().toISOString(), req.method, req.originalUrl)
   next()
 })
@@ -55,7 +55,7 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 // health
-app.get('/health', (req,res)=> res.json({ok:true}))
+app.get('/health', (req, res) => res.json({ ok: true }))
 
 // Login endpoint
 app.post('/login', (req, res) => {
@@ -106,62 +106,89 @@ proj4.defs(IOWA_NORTH_NAD83_FTUS, '+proj=lcc +lat_0=41.5 +lon_0=-93.5 +lat_1=42.
 
 // Use an environment variable for the API base URL, with a default for local development.
 const API_BASE = process.env.P2C_API_BASE || 'http://localhost:8083/api/Data'
-const cache = new NodeCache({stdTTL: 60*60*24, checkperiod:120}) // 1 day TTL for geocoding
+const cache = new NodeCache({ stdTTL: 60 * 60 * 24, checkperiod: 120 }) // 1 day TTL for geocoding
 
-function sanitizeIdentifier(id){
-  if(!id) return ''
-  if(/[^a-zA-Z0-9_\.]/.test(id)) throw new Error('Invalid identifier')
+function sanitizeIdentifier(id) {
+  if (!id) return ''
+  if (/[^a-zA-Z0-9_\.]/.test(id)) throw new Error('Invalid identifier')
   return id
 }
+
+// Simple delay function
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function geocodeAddress(address) {
   if (!address) return null;
 
   // Clean up address string for better geocoding results
-  const cleanedAddress = address
+  let cleanedAddress = address
+    .replace(/^(at|on)\s+/i, '') // Remove leading "at " or "on "
+    .replace(/\s+at\s+/gi, ' and ') // " at " -> " and " (intersection)
+    .replace(/\s+on\s+/gi, ' ')     // " on " -> " " (remove noise)
     .replace(/-BLK/gi, ' ')      // "100-BLK" -> "100"
     .replace(/\//g, ' and ')     // "ST A / ST B" -> "ST A and ST B"
+    .replace(/,(\s*,)+/g, ',')   // Remove double commas
     .trim();
+
+  // Heuristic: If it looks like an intersection with a specific house number, remove the number
+  // e.g. "1344 John F Kennedy Rd and wacker Dr" -> "John F Kennedy Rd and wacker Dr"
+  if (/\s+and\s+/i.test(cleanedAddress) && /^\d+\s+/.test(cleanedAddress)) {
+    cleanedAddress = cleanedAddress.replace(/^\d+\s+/, '');
+  }
 
   const key = `geo:${cleanedAddress}`;
   const cached = cache.get(key);
   if (cached) return cached;
 
-  try {
-    const r = await axios.get('http://192.168.0.212:8080/search', {
-      params: { q: cleanedAddress, format: 'json', limit: 1, addressdetails: 0 },
-      headers: { 'User-Agent': 'p2c-frontend' }
-    });
-    const out = r.data && r.data[0] ? { lat: Number(r.data[0].lat), lon: Number(r.data[0].lon) } : null;
-    cache.set(key, out);
-    console.log('geocoded', `"${address}" (as "${cleanedAddress}")`, '=>', out);
-    return out;
-  } catch (e) {
-    console.error(`Geocoding failed for "${cleanedAddress}":`, e.message);
-    return null;
+  const geocoderUrl = process.env.NOMINATIM_URL || 'http://192.168.0.212:8080/search';
+
+  let attempts = 0;
+  const maxAttempts = 3;
+
+  while (attempts < maxAttempts) {
+    try {
+      const r = await axios.get(geocoderUrl, {
+        params: { q: cleanedAddress, format: 'json', limit: 1, addressdetails: 0 },
+        headers: { 'User-Agent': 'p2c-frontend' },
+        timeout: 5000 // 5s timeout
+      });
+      const out = r.data && r.data[0] ? { lat: Number(r.data[0].lat), lon: Number(r.data[0].lon) } : null;
+      cache.set(key, out);
+      console.log('geocoded', `"${address}" (as "${cleanedAddress}")`, '=>', out);
+      return out;
+    } catch (e) {
+      attempts++;
+      console.error(`Geocoding attempt ${attempts} failed for "${cleanedAddress}":`, e.message);
+      if (attempts >= maxAttempts) {
+        return null;
+      }
+      // Aggressive retry: small backoff
+      await sleep(200 * attempts);
+    }
   }
+  return null;
 }
 
-app.get('/tables', async (req,res)=>{
-  try{
+app.get('/tables', async (req, res) => {
+  try {
     console.log('fetching tables from', `${API_BASE}/tables`)
     const r = await axios.get(`${API_BASE}/tables`)
     console.log('tables status', r.status)
     res.json(r.data)
-  }catch(e){
-    res.status(502).json({error: e.message})
+  } catch (e) {
+    res.status(502).json({ error: e.message })
   }
 })
 
-app.get('/schema', async (req,res)=>{
-  try{
+app.get('/schema', async (req, res) => {
+  try {
     const table = req.query.table
     sanitizeIdentifier(table)
     console.log('fetching schema for', table)
     const r = await axios.get(`${API_BASE}/schema?table=${encodeURIComponent(table)}`)
     res.json(r.data)
-  }catch(e){
-    res.status(502).json({error: e.message})
+  } catch (e) {
+    res.status(502).json({ error: e.message })
   }
 })
 
@@ -198,14 +225,14 @@ app.get('/rawQuery', async (req, res) => {
 })
 
 // Geocode endpoint using Nominatim with cache
-app.get('/geocode', async (req,res)=>{
+app.get('/geocode', async (req, res) => {
   const q = req.query.q
-  if(!q) return res.status(400).json({error:'q query required'})
-  try{
+  if (!q) return res.status(400).json({ error: 'q query required' })
+  try {
     const out = await geocodeAddress(q);
     res.json(out)
-  }catch(e){
-    res.status(502).json({error:e.message})
+  } catch (e) {
+    res.status(502).json({ error: e.message })
   }
 })
 
@@ -251,7 +278,7 @@ app.get('/proximity', async (req, res) => {
     console.log('Executing proximity query:', sql);
     const url = `${API_BASE}/rawQuery?sql=${encodeURIComponent(sql)}`;
     const r = await axios.get(url);
-    
+
     // Format distance to 2 decimal places and convert geox/geoy back to lat/lon for the map
     const results = (r.data?.data || []).map(row => ({
       ...row,
@@ -273,58 +300,58 @@ app.get('/proximity', async (req, res) => {
 });
 
 // Combined endpoint: fetch both tables, join geocoded coords for DailyBulletinArrests then return combined data
-app.get('/incidents', async (req,res)=>{
-  try{
+app.get('/incidents', async (req, res) => {
+  try {
     const { cadLimit = 100, arrestLimit = 100, crimeLimit = 100, dateFrom, dateTo, filters, distanceKm, centerLat, centerLng } = req.query;
 
-  // CRITICAL: The 'filters' parameter is a SQL injection vector and has been disabled.
-  // Do not re-enable without a safe implementation (e.g., parameterized queries or strict validation).
-  const safeFilters = '';
-  if (filters) console.warn('[incidents] WARNING: The "filters" query parameter is currently disabled for security reasons.');
+    // CRITICAL: The 'filters' parameter is a SQL injection vector and has been disabled.
+    // Do not re-enable without a safe implementation (e.g., parameterized queries or strict validation).
+    const safeFilters = '';
+    if (filters) console.warn('[incidents] WARNING: The "filters" query parameter is currently disabled for security reasons.');
 
-  const buildQuery = (table, limit, filters = '', orderBy = 'starttime DESC') => {
-    const params = new URLSearchParams({
-      table,
-      limit: Number(limit) || 100,
-    });
-    if (filters) params.set('filters', filters);
-    if (orderBy) params.set('orderBy', orderBy);
+    const buildQuery = (table, limit, filters = '', orderBy = 'starttime DESC') => {
+      const params = new URLSearchParams({
+        table,
+        limit: Number(limit) || 100,
+      });
+      if (filters) params.set('filters', filters);
+      if (orderBy) params.set('orderBy', orderBy);
 
-    const url = `${API_BASE}/query?${params.toString()}`;
-    console.log(`[incidents] EXECUTING parameterized query for ${table} via GET: ${url}`);
-    // The backend API now handles constructing the safe SQL
-    return axios.get(url);
-  };
+      const url = `${API_BASE}/query?${params.toString()}`;
+      console.log(`[incidents] EXECUTING parameterized query for ${table} via GET: ${url}`);
+      // The backend API now handles constructing the safe SQL
+      return axios.get(url);
+    };
 
-  console.log(`[incidents] INFO: Fetching data with filters: "${safeFilters}"`);
-  
-  // Build date filters for DailyBulletinArrests table which uses 'event_time'
-  let dbDateFilters = [];
-  if (dateFrom) {
-    dbDateFilters.push(`event_time >= '${dateFrom.replace(/'/g, "''")}'`);
-  }
-  if (dateTo) {
-    dbDateFilters.push(`event_time <= '${dateTo.replace(/'/g, "''")}'`);
-  }
-  const dbFilters = dbDateFilters.join(' AND ');
+    console.log(`[incidents] INFO: Fetching data with filters: "${safeFilters}"`);
 
-  const results = await Promise.all([
-    buildQuery('cadHandler', cadLimit, safeFilters, 'starttime DESC'),
-    buildQuery('DailyBulletinArrests', arrestLimit, `[key] <> 'LW'${dbFilters ? ` AND ${dbFilters}` : ''}`, 'event_time DESC'),
-    buildQuery('DailyBulletinArrests', crimeLimit, `[key] = 'LW'${dbFilters ? ` AND ${dbFilters}` : ''}`, 'event_time DESC')
-  ]);
-  const [cadRes, arrestRes, crimeRes] = results;
+    // Build date filters for DailyBulletinArrests table which uses 'event_time'
+    let dbDateFilters = [];
+    if (dateFrom) {
+      dbDateFilters.push(`event_time >= '${dateFrom.replace(/'/g, "''")}'`);
+    }
+    if (dateTo) {
+      dbDateFilters.push(`event_time <= '${dateTo.replace(/'/g, "''")}'`);
+    }
+    const dbFilters = dbDateFilters.join(' AND ');
 
-  console.log(`[incidents] INFO: Received from upstream: ${cadRes.data?.data?.length} CAD, ${arrestRes.data?.data?.length} Arrests, ${crimeRes.data?.data?.length} Crime`);
-  
-  const cadRows = cadRes.data?.data || [];
-  const arrestRows = arrestRes.data?.data || [];
-  const crimeRows = crimeRes.data?.data || [];
+    const results = await Promise.all([
+      buildQuery('cadHandler', cadLimit, safeFilters, 'starttime DESC'),
+      buildQuery('DailyBulletinArrests', arrestLimit, `[key] <> 'LW'${dbFilters ? ` AND ${dbFilters}` : ''}`, 'event_time DESC'),
+      buildQuery('DailyBulletinArrests', crimeLimit, `[key] = 'LW'${dbFilters ? ` AND ${dbFilters}` : ''}`, 'event_time DESC')
+    ]);
+    const [cadRes, arrestRes, crimeRes] = results;
 
-  // Tag rows with their source and combine them. Geocoding will now happen on the client.
-  const processedCadRows = cadRows.map(r => ({ ...r, _source: 'cadHandler' }));
-  const geocodedArrests = arrestRows.map(r => ({ ...r, _source: 'DailyBulletinArrests' }));
-  const geocodedCrime = crimeRows.map(r => ({ ...r, _source: 'Crime' }));
+    console.log(`[incidents] INFO: Received from upstream: ${cadRes.data?.data?.length} CAD, ${arrestRes.data?.data?.length} Arrests, ${crimeRes.data?.data?.length} Crime`);
+
+    const cadRows = cadRes.data?.data || [];
+    const arrestRows = arrestRes.data?.data || [];
+    const crimeRows = crimeRes.data?.data || [];
+
+    // Tag rows with their source and combine them. Geocoding will now happen on the client.
+    const processedCadRows = cadRows.map(r => ({ ...r, _source: 'cadHandler' }));
+    const geocodedArrests = arrestRows.map(r => ({ ...r, _source: 'DailyBulletinArrests' }));
+    const geocodedCrime = crimeRows.map(r => ({ ...r, _source: 'Crime' }));
 
     console.log('[incidents] INFO: Combining and filtering results...');
     let combined = []
@@ -333,20 +360,20 @@ app.get('/incidents', async (req,res)=>{
     combined = combined.concat(geocodedCrime);
 
     // optional server-side distance filtering (if provided)
-    if(distanceKm && centerLat && centerLng){
+    if (distanceKm && centerLat && centerLng) {
       const dKm = Number(distanceKm)
       const lat0 = Number(centerLat)
       const lon0 = Number(centerLng)
-      const haversineKm = (lat1,lon1,lat2,lon2) => {
+      const haversineKm = (lat1, lon1, lat2, lon2) => {
         const R = 6371
-        const toRad = v=> v * Math.PI / 180
-        const dLat = toRad(lat2-lat1)
-        const dLon = toRad(lon2-lon1)
-        const a = Math.sin(dLat/2)*Math.sin(dLat/2) + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)*Math.sin(dLon/2)
-        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a))
+        const toRad = v => v * Math.PI / 180
+        const dLat = toRad(lat2 - lat1)
+        const dLon = toRad(lon2 - lon1)
+        const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2)
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
         return R * c
       }
-      combined = combined.filter(r=> {
+      combined = combined.filter(r => {
         const lat = r.lat || r.geoy;
         const lon = r.lon || r.geox;
         return lat != null && lon != null && haversineKm(lat0, lon0, Number(lat), Number(lon)) <= dKm;
@@ -354,12 +381,12 @@ app.get('/incidents', async (req,res)=>{
     }
 
     console.log(`[incidents] SUCCESS: Sending ${combined.length} combined records to client.`);
-    res.json({data:combined})
-  }catch(e){
+    res.json({ data: combined })
+  } catch (e) {
     console.error('[incidents] FATAL: An unexpected error occurred in the /incidents handler:', e);
-    res.status(502).json({error:e.message})
+    res.status(502).json({ error: e.message })
   }
 })
 
 const port = process.env.PORT || 9000
-app.listen(port, ()=> console.log('Proxy listening on', port))
+app.listen(port, () => console.log('Proxy listening on', port))
