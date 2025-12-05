@@ -28,25 +28,8 @@ app.use((req, res, next) => {
   next()
 })
 
-// JWT Authentication Middleware
-const authenticateToken = (req, res, next) => {
-  // Allow health check and login endpoints to pass without a token
-  if (req.path === '/health' || req.path === '/login') {
-    return next();
-  }
-
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
-
-  if (token == null) return res.sendStatus(401); // if there isn't any token
-
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) return res.sendStatus(403); // if token is no longer valid
-    req.user = user;
-    next(); // proceed to the next middleware
-  });
-};
-app.use(authenticateToken);
+// Authentication middleware removed
+// app.use(authenticateToken);
 
 // Add a global error handler for unhandled promise rejections to prevent silent crashes
 process.on('unhandledRejection', (reason, promise) => {
@@ -117,11 +100,9 @@ function sanitizeIdentifier(id) {
 // Simple delay function
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function geocodeAddress(address) {
-  if (!address) return null;
-
-  // Clean up address string for better geocoding results
-  let cleanedAddress = address
+function cleanAddress(address) {
+  if (!address) return '';
+  let cleaned = address
     .replace(/^(at|on)\s+/i, '') // Remove leading "at " or "on "
     .replace(/\s+at\s+/gi, ' and ') // " at " -> " and " (intersection)
     .replace(/\s+on\s+/gi, ' ')     // " on " -> " " (remove noise)
@@ -131,11 +112,16 @@ async function geocodeAddress(address) {
     .trim();
 
   // Heuristic: If it looks like an intersection with a specific house number, remove the number
-  // e.g. "1344 John F Kennedy Rd and wacker Dr" -> "John F Kennedy Rd and wacker Dr"
-  if (/\s+and\s+/i.test(cleanedAddress) && /^\d+\s+/.test(cleanedAddress)) {
-    cleanedAddress = cleanedAddress.replace(/^\d+\s+/, '');
+  if (/\s+and\s+/i.test(cleaned) && /^\d+\s+/.test(cleaned)) {
+    cleaned = cleaned.replace(/^\d+\s+/, '');
   }
+  return cleaned;
+}
 
+async function geocodeAddress(address) {
+  if (!address) return null;
+
+  const cleanedAddress = cleanAddress(address);
   const key = `geo:${cleanedAddress}`;
   const cached = cache.get(key);
   if (cached) return cached;
@@ -143,14 +129,14 @@ async function geocodeAddress(address) {
   const geocoderUrl = process.env.NOMINATIM_URL || 'http://192.168.0.212:8080/search';
 
   let attempts = 0;
-  const maxAttempts = 3;
+  const maxAttempts = 10; // More aggressive retries for local server
 
   while (attempts < maxAttempts) {
     try {
       const r = await axios.get(geocoderUrl, {
         params: { q: cleanedAddress, format: 'json', limit: 1, addressdetails: 0 },
         headers: { 'User-Agent': 'p2c-frontend' },
-        timeout: 5000 // 5s timeout
+        timeout: 10000 // 10s timeout to allow for queueing
       });
       const out = r.data && r.data[0] ? { lat: Number(r.data[0].lat), lon: Number(r.data[0].lon) } : null;
       cache.set(key, out);
@@ -158,12 +144,12 @@ async function geocodeAddress(address) {
       return out;
     } catch (e) {
       attempts++;
-      console.error(`Geocoding attempt ${attempts} failed for "${cleanedAddress}":`, e.message);
+      console.error(`Geocoding attempt ${attempts}/${maxAttempts} failed for "${cleanedAddress}":`, e.message);
       if (attempts >= maxAttempts) {
         return null;
       }
-      // Aggressive retry: small backoff
-      await sleep(200 * attempts);
+      // Back off a little (500ms) but keep retrying
+      await sleep(500);
     }
   }
   return null;
@@ -327,16 +313,21 @@ app.get('/incidents', async (req, res) => {
 
     // Build date filters for DailyBulletinArrests table which uses 'event_time'
     let dbDateFilters = [];
+    let cadDateFilters = [];
+
     if (dateFrom) {
       dbDateFilters.push(`event_time >= '${dateFrom.replace(/'/g, "''")}'`);
+      cadDateFilters.push(`starttime >= '${dateFrom.replace(/'/g, "''")}'`);
     }
     if (dateTo) {
       dbDateFilters.push(`event_time <= '${dateTo.replace(/'/g, "''")}'`);
+      cadDateFilters.push(`starttime <= '${dateTo.replace(/'/g, "''")}'`);
     }
     const dbFilters = dbDateFilters.join(' AND ');
+    const cadFilters = cadDateFilters.join(' AND ');
 
     const results = await Promise.all([
-      buildQuery('cadHandler', cadLimit, safeFilters, 'starttime DESC'),
+      buildQuery('cadHandler', cadLimit, cadFilters, 'starttime DESC'),
       buildQuery('DailyBulletinArrests', arrestLimit, `[key] <> 'LW'${dbFilters ? ` AND ${dbFilters}` : ''}`, 'event_time DESC'),
       buildQuery('DailyBulletinArrests', crimeLimit, `[key] = 'LW'${dbFilters ? ` AND ${dbFilters}` : ''}`, 'event_time DESC')
     ]);
@@ -358,6 +349,27 @@ app.get('/incidents', async (req, res) => {
     combined = combined.concat(processedCadRows);
     combined = combined.concat(geocodedArrests);
     combined = combined.concat(geocodedCrime);
+
+    // --- ENRICHMENT STEP: Attach cached geocodes ---
+    let enrichedCount = 0;
+    combined = combined.map(row => {
+      // If already has lat/lon (e.g. from CAD), keep it
+      if (row.lat && row.lon) return row;
+
+      const address = row.location || row.address;
+      if (address) {
+        const cleaned = cleanAddress(address);
+        const key = `geo:${cleaned}`;
+        const cached = cache.get(key);
+        if (cached) {
+          enrichedCount++;
+          return { ...row, lat: cached.lat, lon: cached.lon };
+        }
+      }
+      return row;
+    });
+    console.log(`[incidents] INFO: Enriched ${enrichedCount} records from cache.`);
+    // -----------------------------------------------
 
     // optional server-side distance filtering (if provided)
     if (distanceKm && centerLat && centerLng) {
