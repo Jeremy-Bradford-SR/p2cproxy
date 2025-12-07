@@ -285,6 +285,56 @@ app.get('/proximity', async (req, res) => {
   }
 });
 
+// Search 360 endpoint: searches DailyBulletinArrests and converts geox/geoy to lat/lon
+app.get('/search360', async (req, res) => {
+  const q = req.query.q;
+  if (!q || q.trim().length < 2) return res.status(400).json({ error: 'Search term must be at least 2 characters' });
+
+  const sanitized = q.replace(/'/g, "''").trim();
+  console.log(`[search360] Searching for: ${sanitized}`);
+
+  // Query DB for records with geox/geoy
+  const sql = `
+    SELECT 
+      id, event_time, charge, name, firstname, lastname, location, [key],
+      geox, geoy
+    FROM dbo.DailyBulletinArrests
+    WHERE 
+      name LIKE '%${sanitized}%' OR
+      firstname LIKE '%${sanitized}%' OR
+      lastname LIKE '%${sanitized}%'
+    ORDER BY event_time DESC
+  `;
+
+  try {
+    const url = `${API_BASE}/rawQuery?sql=${encodeURIComponent(sql)}`;
+    const r = await axios.get(url);
+    const data = r.data?.data || [];
+
+    // Enrich with lat/lon using proj4
+    let convertedCount = 0;
+    const enriched = data.map(row => {
+      if (row.geox && row.geoy) {
+        try {
+          const [lon, lat] = proj4(IOWA_NORTH_NAD83_FTUS, 'WGS84', [Number(row.geox), Number(row.geoy)]);
+          convertedCount++;
+          return { ...row, lat, lon };
+        } catch (err) {
+          return row;
+        }
+      }
+      return row;
+    });
+
+    console.log(`[search360] Found ${data.length} records, converted coords for ${convertedCount}`);
+    res.json({ data: enriched });
+  } catch (e) {
+    console.error('[search360] Error:', e.message);
+    if (e.response) return res.status(e.response.status).json({ error: e.response.data || e.response.statusText });
+    res.status(502).json({ error: e.message });
+  }
+});
+
 // Combined endpoint: fetch both tables, join geocoded coords for DailyBulletinArrests then return combined data
 app.get('/incidents', async (req, res) => {
   try {
