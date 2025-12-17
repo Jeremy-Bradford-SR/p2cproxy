@@ -7,6 +7,9 @@ const cors = require('cors')
 const proj4 = require('proj4')
 const jwt = require('jsonwebtoken')
 const ldap = require('ldapjs');
+const helmet = require('helmet');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
 
 const {
   LDAP_URL,
@@ -18,6 +21,22 @@ const {
 const JWT_SECRET = process.env.JWT_SECRET || 'a-very-secret-key-that-you-should-change';
 
 const app = express()
+
+// 1. Security Headers
+app.use(helmet());
+
+// 2. Compression
+app.use(compression());
+
+// 3. Rate Limiting (1000 reqs / 15 min)
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10000,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use(limiter);
+
 app.use(cors())
 // accept JSON objects and primitives (we allow a JSON string body containing the SQL)
 app.use(bodyParser.json({ strict: false }))
@@ -285,49 +304,384 @@ app.get('/proximity', async (req, res) => {
   }
 });
 
-// Search 360 endpoint: searches DailyBulletinArrests and converts geox/geoy to lat/lon
-app.get('/search360', async (req, res) => {
-  const q = req.query.q;
-  if (!q || q.trim().length < 2) return res.status(400).json({ error: 'Search term must be at least 2 characters' });
 
-  const sanitized = q.replace(/'/g, "''").trim();
-  console.log(`[search360] Searching for: ${sanitized}`);
 
-  // Query DB for records with geox/geoy
-  const sql = `
-    SELECT 
-      id, event_time, charge, name, firstname, lastname, location, [key],
+// Unified Search Endpoint (used by Tab720 / 360 View)
+app.get('/searchP2C', async (req, res) => {
+  const { q, page = 1, limit = 20, lat, lon, radius } = req.query;
+  const pageNum = parseInt(page) || 1;
+  const limitNum = parseInt(limit) || 20;
+
+  // Geospatial Filter Setup
+  let geoWhereCAD = '1=1';
+  let geoWhereDB = '1=1';
+
+  if (lat && lon && radius) {
+    try {
+      const rFt = parseFloat(radius);
+      if (!isNaN(rFt) && rFt > 0) {
+        const center = proj4('WGS84', IOWA_NORTH_NAD83_FTUS, [parseFloat(lon), parseFloat(lat)]);
+        const cx = center[0];
+        const cy = center[1];
+        const minX = cx - rFt;
+        const maxX = cx + rFt;
+        const minY = cy - rFt;
+        const maxY = cy + rFt;
+        const boxFilter = `(geox BETWEEN ${minX} AND ${maxX} AND geoy BETWEEN ${minY} AND ${maxY})`;
+        geoWhereCAD = boxFilter;
+        geoWhereDB = boxFilter;
+      }
+    } catch (e) {
+      console.error('[searchP2C] Geo error:', e);
+    }
+  }
+
+  // Tokenize search term for smarter "First Last" matching
+  const searchTerm = q ? q.trim().replace(/'/g, "''") : '';
+  const tokens = searchTerm.split(/\s+/).filter(t => t.length > 0);
+
+  console.log(`[searchP2C] Query: "${searchTerm}", Tokens: ${tokens.length}, Page: ${pageNum}`);
+
+  // Base conditions
+  let cadWhere = '1=1';
+  let dbWhere = '1=1';
+
+  if (tokens.length > 0) {
+    // For each token, it must match at least ONE of the target fields.
+    // AND the results together.
+    // Example: "Amy Nauman" -> (fields match Amy) AND (fields match Nauman)
+
+    // CAD Fields: nature, address, agency
+    const cadConditions = tokens.map(t =>
+      `(nature LIKE '%${t}%' OR address LIKE '%${t}%' OR agency LIKE '%${t}%')`
+    );
+    cadWhere = cadConditions.join(' AND ');
+
+    // DB Fields: name, firstname, lastname, charge, location
+    const dbConditions = tokens.map(t =>
+      `(name LIKE '%${t}%' OR firstname LIKE '%${t}%' OR lastname LIKE '%${t}%' OR charge LIKE '%${t}%' OR location LIKE '%${t}%')`
+    );
+    dbWhere = dbConditions.join(' AND ');
+  } else if (searchTerm) {
+    // Fallback if split failed or something weird
+    cadWhere = `(nature LIKE '%${searchTerm}%' OR address LIKE '%${searchTerm}%' OR agency LIKE '%${searchTerm}%')`;
+    dbWhere = `(name LIKE '%${searchTerm}%' OR firstname LIKE '%${searchTerm}%' OR lastname LIKE '%${searchTerm}%' OR charge LIKE '%${searchTerm}%' OR location LIKE '%${searchTerm}%')`;
+  }
+
+  const fetchLimit = pageNum * limitNum; // Fetch more to allow decent sorting/pagination after merge
+
+  const cadSql = `
+    SELECT TOP ${fetchLimit}
+      id, starttime as event_time, nature as title, address as location, agency,
+      geox, geoy, 'CAD' as type, 'Incidents' as source
+    FROM cadHandler
+    WHERE ${cadWhere} AND ${geoWhereCAD}
+    ORDER BY starttime DESC
+  `;
+
+  const dbSql = `
+    SELECT TOP ${fetchLimit}
+      id, event_time, charge as title, name, firstname, lastname, location, [key] as type, 'DB' as source,
       geox, geoy
     FROM dbo.DailyBulletinArrests
-    WHERE 
-      name LIKE '%${sanitized}%' OR
-      firstname LIKE '%${sanitized}%' OR
-      lastname LIKE '%${sanitized}%'
+    WHERE ${dbWhere} AND ${geoWhereDB}
     ORDER BY event_time DESC
   `;
 
   try {
-    const url = `${API_BASE}/rawQuery?sql=${encodeURIComponent(sql)}`;
-    const r = await axios.get(url);
-    const data = r.data?.data || [];
+    const [cadRes, dbRes] = await Promise.all([
+      axios.get(`${API_BASE}/rawQuery?sql=${encodeURIComponent(cadSql)}`),
+      axios.get(`${API_BASE}/rawQuery?sql=${encodeURIComponent(dbSql)}`)
+    ]);
 
-    // Enrich with lat/lon using proj4
-    let convertedCount = 0;
-    const enriched = data.map(row => {
-      if (row.geox && row.geoy) {
+    let results = [];
+
+    const processRecord = (r, defaultType) => {
+      let lat = null, lon = null;
+      if (r.geox && r.geoy) {
         try {
-          const [lon, lat] = proj4(IOWA_NORTH_NAD83_FTUS, 'WGS84', [Number(row.geox), Number(row.geoy)]);
-          convertedCount++;
-          return { ...row, lat, lon };
-        } catch (err) {
-          return row;
-        }
+          // Convert only if non-zero
+          const gx = Number(r.geox);
+          const gy = Number(r.geoy);
+          if (gx !== 0 && gy !== 0) {
+            const coords = proj4(IOWA_NORTH_NAD83_FTUS, 'WGS84', [gx, gy]);
+            lon = coords[0];
+            lat = coords[1];
+          }
+        } catch (e) { }
       }
-      return row;
+
+      let typeCode = r.type;
+      if (defaultType === 'DB') typeCode = r.type;
+
+      return {
+        id: r.id,
+        type: typeCode,
+        source: defaultType,
+        title: r.title,
+        subTitle: r.name || '',
+        location: r.location,
+        event_time: r.event_time,
+        agency: r.agency,
+        lat,
+        lon
+      };
+    };
+
+    const cadProcessed = (cadRes.data?.data || []).map(r => processRecord(r, 'CAD'));
+    const dbProcessed = (dbRes.data?.data || []).map(r => processRecord(r, 'DB'));
+
+    results = [...cadProcessed, ...dbProcessed];
+
+    results.sort((a, b) => new Date(b.event_time) - new Date(a.event_time));
+
+    const start = (pageNum - 1) * limitNum;
+    const end = start + limitNum;
+    const paginatedResults = results.slice(start, end);
+
+    res.json({
+      data: paginatedResults,
+      meta: {
+        page: pageNum,
+        limit: limitNum,
+        hasMore: results.length > end
+      }
     });
 
-    console.log(`[search360] Found ${data.length} records, converted coords for ${convertedCount}`);
-    res.json({ data: enriched });
+  } catch (e) {
+    console.error('[searchP2C] Error:', e.message);
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// Geocode endpoint using Nominatim with cache
+app.get('/geocode', async (req, res) => {
+  const q = req.query.q
+  if (!q) return res.status(400).json({ error: 'q query required' })
+  try {
+    const out = await geocodeAddress(q);
+    res.json(out)
+  } catch (e) {
+    res.status(502).json({ error: e.message })
+  }
+})
+
+// Proximity search endpoint
+app.get('/proximity', async (req, res) => {
+  const { address, days = 7, distance = 1000, nature } = req.query;
+  if (!address) {
+    return res.status(400).json({ error: 'Address query parameter is required' });
+  }
+
+  try {
+    // 1. Geocode address to lat/lon
+    const coords = await geocodeAddress(address);
+
+    if (!coords) {
+      return res.status(404).json({ error: 'Address could not be geocoded.' });
+    }
+
+    // 2. Convert lat/lon to Iowa State Plane coordinates
+    const [geox, geoy] = proj4('WGS84', IOWA_NORTH_NAD83_FTUS, [coords.lon, coords.lat]);
+
+    // 3. Calculate start time
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - parseInt(days, 10));
+    const startTimeString = startDate.toISOString().slice(0, 19).replace('T', ' ');
+
+    // 4. Construct and execute the SQL query
+    const distanceFt = parseInt(distance, 10);
+    let whereClauses = [
+      `SQRT(POWER(CAST(geox AS FLOAT) - ${geox}, 2) + POWER(CAST(geoy AS FLOAT) - ${geoy}, 2)) <= ${distanceFt}`,
+      `starttime >= '${startTimeString}'`
+    ];
+    if (nature) whereClauses.push(`nature LIKE '%${nature.replace(/'/g, "''")}%'`);
+
+    const sql = `
+      SELECT TOP 50 id, starttime, closetime, agency, service, nature, address, geox, geoy,
+             SQRT(POWER(CAST(geox AS FLOAT) - ${geox}, 2) + POWER(CAST(geoy AS FLOAT) - ${geoy}, 2)) AS distance_ft
+      FROM cadHandler
+      WHERE ${whereClauses.join(' AND ')}
+      ORDER BY starttime DESC, distance_ft ASC;
+    `;
+
+    console.log('Executing proximity query:', sql);
+    const url = `${API_BASE}/rawQuery?sql=${encodeURIComponent(sql)}`;
+    const r = await axios.get(url);
+
+    // Format distance to 2 decimal places and convert geox/geoy back to lat/lon for the map
+    const results = (r.data?.data || []).map(row => ({
+      ...row,
+      distance_ft: row.distance_ft ? parseFloat(row.distance_ft).toFixed(2) : null,
+      ...(() => {
+        if (row.geox && row.geoy) {
+          const [lon, lat] = proj4(IOWA_NORTH_NAD83_FTUS, 'WGS84', [Number(row.geox), Number(row.geoy)]);
+          return { lat, lon };
+        }
+        return {};
+      })()
+    }));
+
+    res.status(r.status).json({ data: results });
+  } catch (e) {
+    if (e.response) return res.status(e.response.status).json({ error: e.response.data || e.response.statusText });
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// Search 360 endpoint: searches DailyBulletinArrests, Sex Offenders, and DOC records
+app.get('/search360', async (req, res) => {
+  const { q, page = 1, limit = 50 } = req.query;
+  const pageNum = Math.max(1, parseInt(page));
+  const limitNum = parseInt(limit);
+  const fetchLimit = pageNum * limitNum;
+
+  const safeQ = q ? q.replace(/'/g, "''").trim() : '';
+  if (!safeQ || safeQ.length < 2) return res.json({ data: [] });
+
+  const terms = safeQ.split(/\s+/).filter(t => t.length > 0);
+  console.log(`[search360] Searching for: "${safeQ}" Terms: ${JSON.stringify(terms)} Page: ${pageNum}`);
+
+  try {
+    // Helper to build multi-term AND condition
+    // For each term, it must appear in at least one of the columns
+    // (col1 LIKE %term1% OR col2 LIKE %term1%) AND (col1 LIKE %term2% OR col2 LIKE %term2%)
+    const buildOrLike = (cols) => terms.map(t => `(${cols.map(c => `${c} LIKE '%${t}%'`).join(' OR ')})`).join(' AND ');
+    const buildLike = (col) => terms.map(t => `${col} LIKE '%${t}%'`).join(' AND ');
+
+    // 1. Arrests Query
+    const arrestWhere = buildOrLike(['name', 'firstname', 'lastname', 'charge']);
+    const arrestSql = `
+      SELECT TOP ${fetchLimit}
+        id, event_time, charge, name, firstname, lastname, middlename, location, [key],
+        geox, geoy
+      FROM dbo.DailyBulletinArrests
+      WHERE ${arrestWhere}
+      ORDER BY event_time DESC
+    `;
+
+    // 2. Sex Offenders Query
+    const soWhere = buildOrLike(['first_name', 'last_name']);
+    const soSql = `
+      SELECT TOP ${fetchLimit}
+        registrant_id, first_name, last_name, middle_name, gender, tier, address_line_1, city, lat, lon
+      FROM dbo.sexoffender_registrants
+      WHERE ${soWhere}
+    `;
+
+    // 3. DOC (Probation/Parole) Query
+    // Join Summary with Charges to get status
+    const docWhere = buildLike('s.Name');
+    const docSql = `
+      SELECT TOP ${fetchLimit}
+        s.OffenderNumber, s.Name, s.Gender, s.Age,
+        c.SupervisionStatus, c.OffenseClass, c.EndDate
+      FROM dbo.Offender_Summary s
+      LEFT JOIN dbo.Offender_Charges c ON s.OffenderNumber = c.OffenderNumber
+      WHERE ${docWhere}
+    `;
+
+    const [arrestRes, soRes, docRes] = await Promise.all([
+      axios.get(`${API_BASE}/rawQuery?sql=${encodeURIComponent(arrestSql)}`),
+      axios.get(`${API_BASE}/rawQuery?sql=${encodeURIComponent(soSql)}`),
+      axios.get(`${API_BASE}/rawQuery?sql=${encodeURIComponent(docSql)}`)
+    ]);
+
+    const arrests = arrestRes.data?.data || [];
+    const sexOffenders = soRes.data?.data || [];
+    const docRecords = docRes.data?.data || [];
+
+    // Normalize Results
+    const combined = [];
+
+    // Process Arrests
+    arrests.forEach(row => {
+      let lat = null, lon = null;
+      if (row.geox && row.geoy) {
+        try {
+          [lon, lat] = proj4(IOWA_NORTH_NAD83_FTUS, 'WGS84', [Number(row.geox), Number(row.geoy)]);
+        } catch (e) { }
+      }
+      combined.push({
+        type: 'ARREST',
+        id: row.id,
+        name: row.name || `${row.firstname} ${row.lastname}`,
+        firstname: row.firstname,
+        lastname: row.lastname,
+        middlename: row.middlename,
+        details: row.charge,
+        date: row.event_time,
+        location: row.location,
+        lat, lon,
+        raw: row
+      });
+    });
+
+    // Process Sex Offenders
+    sexOffenders.forEach(row => {
+      combined.push({
+        type: 'SEX_OFFENDER',
+        id: row.registrant_id,
+        name: `${row.first_name} ${row.last_name}`,
+        firstname: row.first_name,
+        lastname: row.last_name,
+        middlename: row.middle_name,
+        details: `Tier ${row.tier} Sex Offender`,
+        location: `${row.address_line_1}, ${row.city}`,
+        lat: row.lat,
+        lon: row.lon,
+        raw: row
+      });
+    });
+
+    // Process DOC
+    docRecords.forEach(row => {
+      let type = 'DOC';
+      const status = (row.SupervisionStatus || '').toUpperCase();
+      if (status.includes('PROBATION')) type = 'PROBATION';
+      else if (status.includes('PAROLE')) type = 'PAROLE';
+
+      // Attempt split name for DOC
+      const nameParts = (row.Name || '').split(' ');
+      const fname = nameParts[0] || '';
+      const lname = nameParts.length > 1 ? nameParts.slice(1).join(' ') : '';
+
+      combined.push({
+        type: type,
+        id: row.OffenderNumber,
+        name: row.Name,
+        firstname: fname,
+        lastname: lname,
+        details: `${row.SupervisionStatus} - ${row.OffenseClass}`,
+        date: row.EndDate, // Use EndDate as a relevant date
+        location: 'N/A', // DOC records often lack specific current address in summary
+        lat: null, lon: null,
+        raw: row,
+        OffenderNumbers: row.OffenderNumber // explicit for robust matching
+      });
+    });
+
+    console.log(`[search360] Found ${arrests.length} arrests, ${sexOffenders.length} sex offenders, ${docRecords.length} DOC records`);
+
+    // Sort combined results - prioritize date if available? Or just mix them? 
+    // Usually mix is okay, but sticking to logic of source priority (Arrest > SO > DOC) as implicit in push order.
+    // Or we can sort by name?
+    // Let's keep implicit order but SLICE for pagination.
+
+    const start = (pageNum - 1) * limitNum;
+    const end = start + limitNum;
+    const paginated = combined.slice(start, end);
+
+    res.json({
+      data: paginated,
+      meta: {
+        page: pageNum,
+        limit: limitNum,
+        totalFetched: combined.length,
+        hasMore: combined.length > end
+      }
+    });
+
   } catch (e) {
     console.error('[search360] Error:', e.message);
     if (e.response) return res.status(e.response.status).json({ error: e.response.data || e.response.statusText });
@@ -335,7 +689,7 @@ app.get('/search360', async (req, res) => {
   }
 });
 
-// Combined endpoint: fetch both tables, join geocoded coords for DailyBulletinArrests then return combined data
+// Unified P2C Search endpoint
 app.get('/incidents', async (req, res) => {
   try {
     const { cadLimit = 100, arrestLimit = 100, crimeLimit = 100, dateFrom, dateTo, filters, distanceKm, centerLat, centerLng } = req.query;
