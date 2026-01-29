@@ -126,6 +126,7 @@ function cleanAddress(address) {
     .replace(/\s+at\s+/gi, ' and ') // " at " -> " and " (intersection)
     .replace(/\s+on\s+/gi, ' ')     // " on " -> " " (remove noise)
     .replace(/-BLK/gi, ' ')      // "100-BLK" -> "100"
+    .replace(/\s+BLK/gi, ' ')    // "100 BLK" -> "100"
     .replace(/\//g, ' and ')     // "ST A / ST B" -> "ST A and ST B"
     .replace(/,(\s*,)+/g, ',')   // Remove double commas
     .trim();
@@ -197,6 +198,19 @@ app.get('/schema', async (req, res) => {
   }
 })
 
+app.get('/Data/sex-offenders', async (req, res) => {
+  try {
+    const { page, limit } = req.query;
+    console.log('fetching sex offenders', { page, limit });
+    const url = `${API_BASE}/sex-offenders?page=${page || 1}&limit=${limit || 50}`;
+    const r = await axios.get(url);
+    res.json(r.data);
+  } catch (e) {
+    if (e.response) return res.status(e.response.status).json({ error: e.response.data || e.response.statusText });
+    res.status(502).json({ error: e.message });
+  }
+})
+
 // Proxy for the new parameterized /query endpoint
 app.get('/query', async (req, res) => {
   try {
@@ -241,68 +255,7 @@ app.get('/geocode', async (req, res) => {
   }
 })
 
-// Proximity search endpoint
-app.get('/proximity', async (req, res) => {
-  const { address, days = 7, distance = 1000, nature } = req.query;
-  if (!address) {
-    return res.status(400).json({ error: 'Address query parameter is required' });
-  }
 
-  try {
-    // 1. Geocode address to lat/lon
-    const coords = await geocodeAddress(address);
-
-    if (!coords) {
-      return res.status(404).json({ error: 'Address could not be geocoded.' });
-    }
-
-    // 2. Convert lat/lon to Iowa State Plane coordinates
-    const [geox, geoy] = proj4('WGS84', IOWA_NORTH_NAD83_FTUS, [coords.lon, coords.lat]);
-
-    // 3. Calculate start time
-    const startDate = new Date();
-    startDate.setDate(startDate.getDate() - parseInt(days, 10));
-    const startTimeString = startDate.toISOString().slice(0, 19).replace('T', ' ');
-
-    // 4. Construct and execute the SQL query
-    const distanceFt = parseInt(distance, 10);
-    let whereClauses = [
-      `SQRT(POWER(CAST(geox AS FLOAT) - ${geox}, 2) + POWER(CAST(geoy AS FLOAT) - ${geoy}, 2)) <= ${distanceFt}`,
-      `starttime >= '${startTimeString}'`
-    ];
-    if (nature) whereClauses.push(`nature LIKE '%${nature.replace(/'/g, "''")}%'`);
-
-    const sql = `
-      SELECT TOP 50 id, starttime, closetime, agency, service, nature, address, geox, geoy,
-             SQRT(POWER(CAST(geox AS FLOAT) - ${geox}, 2) + POWER(CAST(geoy AS FLOAT) - ${geoy}, 2)) AS distance_ft
-      FROM cadHandler
-      WHERE ${whereClauses.join(' AND ')}
-      ORDER BY starttime DESC, distance_ft ASC;
-    `;
-
-    console.log('Executing proximity query:', sql);
-    const url = `${API_BASE}/rawQuery?sql=${encodeURIComponent(sql)}`;
-    const r = await axios.get(url);
-
-    // Format distance to 2 decimal places and convert geox/geoy back to lat/lon for the map
-    const results = (r.data?.data || []).map(row => ({
-      ...row,
-      distance_ft: row.distance_ft ? parseFloat(row.distance_ft).toFixed(2) : null,
-      ...(() => {
-        if (row.geox && row.geoy) {
-          const [lon, lat] = proj4(IOWA_NORTH_NAD83_FTUS, 'WGS84', [Number(row.geox), Number(row.geoy)]);
-          return { lat, lon };
-        }
-        return {};
-      })()
-    }));
-
-    res.status(r.status).json({ data: results });
-  } catch (e) {
-    if (e.response) return res.status(e.response.status).json({ error: e.response.data || e.response.statusText });
-    res.status(502).json({ error: e.message });
-  }
-});
 
 
 
@@ -502,7 +455,7 @@ app.get('/proximity', async (req, res) => {
              SQRT(POWER(CAST(geox AS FLOAT) - ${geox}, 2) + POWER(CAST(geoy AS FLOAT) - ${geoy}, 2)) AS distance_ft
       FROM cadHandler
       WHERE ${whereClauses.join(' AND ')}
-      ORDER BY starttime DESC, distance_ft ASC;
+      ORDER BY starttime DESC, distance_ft ASC
     `;
 
     console.log('Executing proximity query:', sql);
@@ -581,18 +534,52 @@ app.get('/search360', async (req, res) => {
       WHERE ${docWhere}
     `;
 
-    const [arrestRes, soRes, docRes] = await Promise.all([
+    // 4. CAD Incidents Query
+    // Search nature, address, agency
+    const cadWhere = buildOrLike(['nature', 'address', 'agency']);
+    const cadSql = `
+      SELECT TOP ${fetchLimit}
+        id, starttime, nature, address, agency, geox, geoy
+      FROM cadHandler
+      WHERE ${cadWhere}
+      ORDER BY starttime DESC
+    `;
+
+    const [arrestRes, soRes, docRes, cadRes] = await Promise.all([
       axios.get(`${API_BASE}/rawQuery?sql=${encodeURIComponent(arrestSql)}`),
       axios.get(`${API_BASE}/rawQuery?sql=${encodeURIComponent(soSql)}`),
-      axios.get(`${API_BASE}/rawQuery?sql=${encodeURIComponent(docSql)}`)
+      axios.get(`${API_BASE}/rawQuery?sql=${encodeURIComponent(docSql)}`),
+      axios.get(`${API_BASE}/rawQuery?sql=${encodeURIComponent(cadSql)}`)
     ]);
 
     const arrests = arrestRes.data?.data || [];
     const sexOffenders = soRes.data?.data || [];
     const docRecords = docRes.data?.data || [];
+    const cadRecords = cadRes.data?.data || [];
 
     // Normalize Results
     const combined = [];
+
+    // Process CAD
+    cadRecords.forEach(row => {
+      let lat = null, lon = null;
+      if (row.geox && row.geoy) {
+        try {
+          [lon, lat] = proj4(IOWA_NORTH_NAD83_FTUS, 'WGS84', [Number(row.geox), Number(row.geoy)]);
+        } catch (e) { }
+      }
+      combined.push({
+        type: 'CAD',
+        id: row.id,
+        name: row.agency || 'Unknown Agency', // CAD doesn't have person name usually
+        firstname: '', lastname: '',
+        details: row.nature,
+        date: row.starttime,
+        location: row.address,
+        lat, lon,
+        raw: row
+      });
+    });
 
     // Process Arrests
     arrests.forEach(row => {
@@ -602,8 +589,13 @@ app.get('/search360', async (req, res) => {
           [lon, lat] = proj4(IOWA_NORTH_NAD83_FTUS, 'WGS84', [Number(row.geox), Number(row.geoy)]);
         } catch (e) { }
       }
+      let type = 'ARREST';
+      if (row.key === 'TC') type = 'CITATION';
+      else if (row.key === 'TA') type = 'ACCIDENT';
+      else if (row.key === 'LW') type = 'CRIME';
+
       combined.push({
-        type: 'ARREST',
+        type: type,
         id: row.id,
         name: row.name || `${row.firstname} ${row.lastname}`,
         firstname: row.firstname,
