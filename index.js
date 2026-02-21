@@ -4,7 +4,6 @@ const axios = require('axios');
 const NodeCache = require('node-cache');
 const bodyParser = require('body-parser');
 const cors = require('cors');
-const proj4 = require('proj4');
 const jwt = require('jsonwebtoken');
 const ldap = require('ldapjs');
 const helmet = require('helmet');
@@ -32,120 +31,43 @@ const {
   FALLBACK_PASS
 } = process.env;
 
-// --- CLUSTERING ---
-if (cluster.isPrimary) {
-  const numCPUs = os.cpus().length;
-  console.log(`[Master] Primary ${process.pid} is running`);
-  console.log(`[Master] Forking ${numCPUs} workers...`);
+// --- CLUSTERING DISABLED FOR STABILITY ---
+// if (cluster.isPrimary) { ... }
+// Running directly as single process
+startWorker();
 
-  for (let i = 0; i < numCPUs; i++) {
-    cluster.fork();
-  }
-
-  cluster.on('exit', (worker, code, signal) => {
-    console.warn(`[Master] Worker ${worker.process.pid} died. Restarting...`);
-    cluster.fork();
-  });
-} else {
-  // --- WORKER PROCESS ---
-  startWorker();
-}
 
 function startWorker() {
   const app = express();
 
-  // 1. Connection Pooling (Keep-Alive)
-  // Reduce TCP overhead by keeping connections open
-  const axiosInstance = axios.create({
-    httpAgent: new http.Agent({ keepAlive: true }),
-    httpsAgent: new https.Agent({ keepAlive: true }),
-    timeout: 30000 // 30s timeout
-  });
-
-  // 2. Optimized Caching
-  // Added maxKeys to prevent OOM
-  const cache = new NodeCache({ stdTTL: 60 * 60 * 24, checkperiod: 120, maxKeys: 10000 });
-
-  // 3. Security Headers
-  app.use(helmet());
-
-  // 4. Compression
-  app.use(compression());
-
-  // 5. Rate Limiting
-  // Note: In a cluster, this limit is per-worker (memory store). 
-  // For strict global limits, Redis is needed, but this prevents abuse per-core.
-  const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 2000, // Increased limit per worker slightly
-    standardHeaders: true,
-    legacyHeaders: false,
-  });
-  app.use(limiter);
-
-  app.use(cors());
-  app.use(bodyParser.json({ strict: false }));
-
-  // Logging
-  app.use((req, res, next) => {
-    // Reduced logging noise for health checks
-    if (req.originalUrl !== '/health') {
-      console.log(`[Worker ${process.pid}] ${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
-    }
-    next();
-  });
-
-  // 6. Security: Authentication Middleware
-  function authenticateToken(req, res, next) {
-    if (!ENABLE_AUTH) {
-      // Log once per worker ideally, but here we just pass through
-      return next();
-    }
-
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-
-    if (!token) return res.status(401).json({ message: 'Authentication required' });
-
-    jwt.verify(token, JWT_SECRET, (err, user) => {
-      if (err) return res.status(403).json({ message: 'Invalid or expired token' });
-      req.user = user;
-      next();
-    });
-  }
-
-  app.use(authenticateToken); // Apply to all routes (Login excluded below manually if needed, or put above)
-
-  // Unhandled Rejections
-  process.on('unhandledRejection', (reason, promise) => {
-    console.error('!!! UNHANDLED REJECTION AT:', promise, 'REASON:', reason);
-  });
-
-  // Health Check (Public)
-  app.get('/health', (req, res) => res.json({ ok: true, worker: process.pid }));
-
-  // Login Endpoint (Public - bypassed in Middleware? No, middleware is currently Global)
-  // Fix: Move Login ABOVE authenticateToken or make generic middleware smarter.
-  // For now, let's redefine middleware application.
-
-  // REDEFINING MIDDLEWARE STACK TO EXCLUDE LOGIN FROM AUTH
-}
-
-// Rewriting startWorker with correct middleware order for Login
-function startWorker() {
-  const app = express();
+  // Fix for Rate Limit 'X-Forwarded-For' error
+  app.set('trust proxy', 1);
 
   // Axios Instance with Keep-Alive
   const axiosInstance = axios.create({
     httpAgent: new http.Agent({ keepAlive: true }),
     httpsAgent: new https.Agent({ keepAlive: true }),
-    timeout: 30000
+    timeout: 120000 // Increased to 120s to match backend
   });
 
   // Cache with limits
   const cache = new NodeCache({ stdTTL: 60 * 60 * 24, checkperiod: 120, maxKeys: 10000 });
 
-  app.use(helmet());
+  // Relax CSP to allow React/react-window inline styles and scripts
+  app.use(helmet({
+    contentSecurityPolicy: {
+      directives: {
+        ...helmet.contentSecurityPolicy.getDefaultDirectives(),
+        "default-src": ["'self'", "*"],
+        "script-src": ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
+        "style-src": ["'self'", "'unsafe-inline'"],
+        "img-src": ["'self'", "data:", "https:", "*"],
+        "connect-src": ["'self'", "*"],
+        "font-src": ["'self'", "data:", "https:", "*"]
+      },
+    },
+    crossOriginEmbedderPolicy: false
+  }));
   app.use(compression());
 
   // Rate Limit (per worker)
@@ -277,7 +199,16 @@ function startWorker() {
         validateStatus: () => true // We handle status
       });
 
-      res.status(response.status).json(response.data);
+      // Filter unsafe headers that might confuse Nginx/Client
+      const unsafeHeaders = ['content-length', 'content-encoding', 'transfer-encoding', 'connection'];
+      const headers = {};
+      Object.keys(response.headers).forEach(key => {
+        if (!unsafeHeaders.includes(key.toLowerCase())) {
+          headers[key] = response.headers[key];
+        }
+      });
+
+      res.status(response.status).set(headers).send(response.data);
     } catch (e) {
       console.error(`[Proxy] Forward Error (${path}):`, e.message);
       // Standardized Error Response
